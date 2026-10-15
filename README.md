@@ -1,211 +1,134 @@
-# Walmart Sales Data Pipeline
+# Nursing-Home Staffing Pipeline: Google Drive to AWS Medallion
 
-An end-to-end ELT project that loads Walmart sales data from Amazon S3 into Snowflake, models it into a star schema with dbt, and visualizes the results with Python.
+An automated AWS data pipeline that ingests 21 CMS nursing-home files from Google Drive, cleans them into 21 typed Silver tables, and builds six analysis-ready Gold tables. The Gold layer answers staffing questions: how many nursing hours residents receive, how that differs by state and ownership type, and whether it relates to occupancy or hospitalization rates.
+
+The pipeline runs daily, loads only files that changed, protects data quality with quarantine and flags, and emails on failure.
+
+**Stack:** AWS Lambda, S3, DynamoDB, Secrets Manager, AWS Glue (Spark and Python), Glue Data Catalog, Athena, Step Functions, EventBridge Scheduler, SNS, IAM, and Amazon QuickSight. I chose this stack as opposed to mostly Glue because I wanted to get my hands on many technologies and couple them.
+
+Author: Eze Amadi https://www.linkedin.com/in/ezeamadi/
+
+## Results (Q2 2024, April to June)
+
+| Metric                                   | Result                                                                                                                                                                           |
+| ---------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Staffing level                           | 3.71 nursing hours per resident per day (resident-weighted); 3.84 as a facility average, against CMS's published 3.837                                                           |
+| Staffing by role                         | CNA 2.08 (56%), LPN 0.87 (24%), RN 0.60 (16%), other aide 0.16 (4%)                                                                                                              |
+| Occupancy                                | About 77.7% nationally, flat across the quarter                                                                                                                                  |
+| Staffing vs occupancy                    | No linear relationship (Pearson r = -0.054, Spearman +0.023). The pattern is U-shaped: 3.95 hours under 60% occupancy, about 3.81 from 60 to 100%, 4.07 above 100%               |
+| Contract-labor share                     | 7.16% of hours in April, 6.89% in June                                                                                                                                           |
+| Staffing vs short-stay rehospitalization | Weak negative association (r = -0.061; RN staffing -0.083). The most-staffed quartile of facilities has a rehospitalization rate of 22.41%, against 23.26% for the least-staffed |
+| Staffing by ownership                    | For-profit groups cluster at 3.57 to 3.58 hours; non-profit corporations 4.17; church-related 4.26; state-run 4.81; hospital districts 3.53                                      |
+
+**Validation:** for facility 015009, the pipeline's computed hours per resident per day is 4.2936, exactly CMS's published 4.2936.
+
+## Architecture
 
 ```
-S3 (CSV files)
-   |  Snowflake storage integration + external stage, COPY INTO
-   v
-Snowflake  BRONZE   raw tables, loaded as-is
-   |  dbt
-   v
-Snowflake  SILVER   cleaned and typed staging models
-   |  dbt
-   v
-Snowflake  GOLD     date dimension, store dimension, sales fact table
-   |  Python (read-only role)
-   v
-Charts (matplotlib)
+Google Drive folder (21 CSVs + 1 PDF data dictionary)
+        |  read by a service account
+        v
+Lambda: gdrive-ingest  <---- checksums ---->  DynamoDB: gdrive-file-state
+        |  new or changed files only
+        v
+S3 Bronze      raw files, partitioned by ingest date
+        v
+Glue: silver-build  --->  S3 Silver (21 typed tables)
+        |                 Quarantine (rejected rows)
+        v
+Glue: gold-build    --->  S3 Gold (6 analysis tables)
+        v
+Athena (queries Silver and Gold through the Glue Data Catalog)
+        v
+QuickSight (Data Visualization)
+
+EventBridge Scheduler (daily, 6:00 AM Chicago)
+   --> Step Functions: ingest --> if new files --> Silver --> Gold
+   --> any failure --> SNS email
 ```
 
-## Tech stack
+| Layer  | Contents                                   | Size                                                    |
+| ------ | ------------------------------------------ | ------------------------------------------------------- |
+| Bronze | Raw files exactly as received              | 21 files                                                |
+| Silver | Cleaned, typed tables, one per source file | 21 tables, 3,421,978 rows, 0 quarantined, 3,957 flagged |
+| Gold   | Wide, pre-joined analysis tables           | 6 tables                                                |
 
-| Layer                      | Tool                                                        |
-| -------------------------- | ----------------------------------------------------------- |
-| Storage                    | Amazon S3                                                   |
-| Warehouse                  | Snowflake                                                   |
-| Transformation and testing | dbt (developed in dbt Cloud), `dbt_utils` package           |
-| Visualization              | Python, pandas, matplotlib, `snowflake-connector-python`    |
-| Authentication             | Key pair authentication for the dbt and visualization users |
+| Gold table                     | One row per                               | Rows      |
+| ------------------------------ | ----------------------------------------- | --------- |
+| gold_staffing_daily            | Facility and day                          | 1,325,324 |
+| gold_staffing_facility_monthly | Facility and month                        | 43,692    |
+| gold_staffing_state_monthly    | State and month                           | 156       |
+| gold_staffing_state_ownership  | State, ownership type and quarter         | 486       |
+| gold_facility_quality_staffing | Facility and quarter                      | 14,564    |
+| gold_relationship_stats        | Statistic (6 pairs, Pearson and Spearman) | 12        |
 
 ## Data
 
-The project uses three CSV files from a Walmart store sales dataset. The files are **not included** in this repository.
+Source: CMS nursing-home data. The main file is the Payroll-Based Journal daily nurse staffing file for Q2 2024 (one row per facility per day). The other 20 files are the October 2024 CMS releases: provider information, quality measures, health and fire-safety citations, penalties, ownership, and value-based purchasing.
 
-| File             | Content                                                                 | Grain                   |
-| ---------------- | ----------------------------------------------------------------------- | ----------------------- |
-| `department.csv` | Weekly sales per department, holiday flag                               | Store, department, week |
-| `fact.csv`       | Temperature, fuel price, markdowns 1-5, CPI, unemployment, holiday flag | Store, week             |
-| `stores.csv`     | Store type and size                                                     | Store                   |
+Everything joins on the CMS Certification Number (CCN), a 6-character string such as `015009`. It is stored as text everywhere because a numeric type would drop leading zeros and break joins.
+
+The data files are not in this repository because of size, and they are public CMS releases. See `.gitignore`.
+
+## Key design decisions
+
+| Decision                                                              | Why                                                                                                        |
+| --------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| Lambda for ingestion, Glue for transformation                         | Ingestion is light file movement; transformation of 1.3 million-row files suits Spark                      |
+| Checksum comparison against a DynamoDB state table                    | Loads only new or changed files, so the first run and every later run use the same code                    |
+| Read every column as text, then cast                                  | Keeps leading zeros in the CCN                                                                             |
+| ANSI mode off; uncastable values become NULL plus a flag              | Bad values are surfaced and counted instead of crashing the job                                            |
+| Quarantine table plus a 5% reject-rate circuit breaker                | Bad rows are kept for inspection; a bad file cannot silently corrupt Silver                                |
+| Delete-then-write per partition                                       | Re-running a build never doubles rows                                                                      |
+| Denormalized Gold with no date dimension                              | Optimized for read speed; no query needs a join. An earlier star-schema draft was replaced for this reason |
+| Hours per resident per day as a ratio of sums                         | Not an average of daily ratios, so busy days and large facilities count in proportion                      |
+| Flag, do not delete, suspect values                                   | Every exclusion is visible and reversible                                                                  |
+| Step Functions Standard workflow, rebuild all of Silver on any change | Glue runs exceed Express limits; no file-to-table mapping to get wrong                                     |
+| Failure email sent from inside the state machine                      | Same coverage as an EventBridge rule, and it works with the console as it is                               |
+
+Details: [docs/data-quality-rules.md](docs/data-quality-rules.md), [docs/gold-model.md](docs/gold-model.md).
+
+## How it runs
+
+Every day at 6:00 AM Chicago time, EventBridge starts a Step Functions state machine. It runs the ingest Lambda. If no file changed, it stops. If something changed, it runs `silver-build` (about 9 minutes) and then `gold-build` (about 5 minutes). Any failure sends an email. For the first time it ingests everything and runs end-to-end.
+
+A forced end-to-end test (one file's DynamoDB record deleted) took about 15 minutes; all 27 Silver and Gold row counts were unchanged afterwards, and the next run ended quietly.
 
 ## Repository layout
 
 ```
-.
-├── README.md
-├── dbt_project.yml
-├── packages.yml
-├── models/
-│   ├── walmart_silver/      stg_stores, stg_department, stg_fact + schema.yml
-│   └── walmart_gold/        walmart_date_dim, walmart_store_dim, walmart_fact_table + schema.yml
-├── macros/
-│   └── generate_schema_name.sql
-├── snowflake/
-│   ├── 01_setup.sql         database, schemas, storage integration, stage
-│   ├── 02_bronze_load.sql   Bronze tables and COPY INTO
-│   └── 03_roles.sql         dbt and visualization roles and grants
-├── viz/
-│   └── walmart-dashboard.py
-├── docs/
-│   └── walmart_dashboard.png
-└── requirements.txt
+README.md
+glue/            silver/silver_build.py, silver/glue-silver-build.json, gold/gold_build.py, gold/glue-gold-build.json, job-settings.md
+lambda/          lambda_function.py, config.md, lambda-config.json
+orchestration/   state_machine.json, schedule.md, schedule.json
+iam/             gdrive-pipeline-sfn-role/ IAM policies as JSON
+sql/             Athena checks and analysis queries
+docs/            data-quality-rules.md, gold-model.md, setup-guide.md, images/
 ```
 
-## Data model
+## Reproduce it
 
-### Bronze
+See [docs/setup-guide.md](docs/setup-guide.md) for the build in order. Account-specific values appear as placeholders such as `<ACCOUNT_ID>` and `<DRIVE_FOLDER_ID>`.
 
-Raw tables loaded directly from S3 with `COPY INTO` through an external stage.
+## Data Visualization
 
-| Table        | Typing                                    | Notes                                                                                                             |
-| ------------ | ----------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
-| `DEPARTMENT` | Typed columns (`DECIMAL(15,2)` for sales) | Loaded with `skip_header = 1`                                                                                     |
-| `FACT`       | All `VARCHAR`                             | Raw landing cannot reject rows. `NULL_IF` converts `NA` and similar text to real NULLs. Casting happens in Silver |
-| `STORES`     | See `snowflake/02_bronze_load.sql`        |                                                                                                                   |
+The visualization was done with Amazon QuickSight =>
+![Correlation Statistics](docs/images/dashboard-correlation.png)
 
-### Silver
+![Staffing by Ownership Types](docs/images/dashboard-ownership.png)
 
-One staging model per Bronze table. Each model selects explicit columns, renames them, and casts types with `TRY_CAST`. Silver is the only layer that reads Bronze (through `source()`).
+![Staffing vs Occupancy](docs/images/dashboard-staffing-vs-occupancy.png)
 
-### Gold
+![Staffing by State and Types](docs/images/dashboard-state-type-1.png)
+![Staffing by State and Types](docs/images/dashboard-state-type-2.png)
 
-| Model                | One row per                | Key                              |
-| -------------------- | -------------------------- | -------------------------------- |
-| `walmart_date_dim`   | Week                       | `date_id` (`YYYYMMDD` integer)   |
-| `walmart_store_dim`  | Store and department pair  | `store_id`, `dept_id`            |
-| `walmart_fact_table` | Store, department and week | `store_id`, `dept_id`, `date_id` |
-
-The fact table starts from department sales and left-joins the store-level measures (temperature, fuel price, CPI, unemployment, markdowns) on store and week, so no sales row is ever dropped. `date_id` was added to the fact table so it can join to the date dimension.
-
-All Gold models are built as **SCD Type 1**: incremental models using the `merge` strategy, a `unique_key`, and `merge_update_columns` so a changed row is overwritten in place while the original `insert_date` is preserved. A `NOT EXISTS` filter sends only new or changed rows to the merge, so `update_date` moves only when a value really changed.
-
-## Setup
-
-### Prerequisites
-
-- An AWS account with an S3 bucket and an IAM role that Snowflake can assume
-- A Snowflake account
-- A dbt Cloud account (or dbt Core with a `profiles.yml`; see the note below)
-- Python 3.10 or newer, and OpenSSL for key generation
-
-### 1. Snowflake and S3
-
-1. Upload the three CSV files to your S3 bucket.
-2. Open `snowflake/01_setup.sql` and replace the placeholders:
-   - `<AWS_ACCOUNT_ID>` and `<IAM_ROLE_NAME>` in the storage integration
-   - `<YOUR_BUCKET>` in the allowed locations and stage URL
-3. Run `DESCRIBE INTEGRATION` and use the returned IAM user ARN and external ID in the role's trust policy.
-4. Run `snowflake/02_bronze_load.sql` to create the Bronze tables and load them. Check the `COPY INTO` output (`rows_parsed`, `rows_loaded`, `errors_seen`) against the CSV row counts.
-
-### 2. Roles and users
-
-Run `snowflake/03_roles.sql`. It creates:
-
-| Role       | Purpose                   | Access                                                       |
-| ---------- | ------------------------- | ------------------------------------------------------------ |
-| `DBT_ROLE` | Used by dbt               | Read Bronze, create objects in Silver, Gold and a dev schema |
-| `VIZ_ROLE` | Used by the Python script | Read-only on the schema holding the Gold tables              |
-
-Each role has a service user that authenticates with a key pair. Generate the keys locally (they are never committed):
-
-```bash
-openssl genrsa 2048 | openssl pkcs8 -topk8 -v2 aes-256-cbc -inform PEM -out dbt_key.p8
-openssl rsa -in dbt_key.p8 -pubout -out dbt_key.pub
-```
-
-Attach the public key to the user with `ALTER USER <user> SET RSA_PUBLIC_KEY = '...'`, using only the text between the `BEGIN` and `END` lines. Repeat with a separate key pair for the visualization user.
-
-### 3. dbt
-
-1. Create a dbt project connected to Snowflake with key pair credentials (database `WALMART_RAW`, role `DBT_ROLE`) and add this repository's files.
-2. Install packages and build:
-
-```bash
-dbt deps
-dbt build --full-refresh   # first run, to create the incremental tables
-dbt build                  # later runs
-```
-
-The `generate_schema_name` macro keeps all objects in the developer's schema outside production, and routes models to `SILVER` and `GOLD` when the target is named `prod`.
-
-**dbt Core:** this project was developed in dbt Cloud, so no `profiles.yml` is included. To use dbt Core, create a `profiles.yml` for Snowflake with key pair authentication and read the secrets from environment variables. Never commit it.
-
-### 4. Visualization
-
-```bash
-python -m venv .venv
-source .venv/bin/activate            # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
-
-export SNOWFLAKE_ACCOUNT="<org>-<account>"
-export SNOWFLAKE_PRIVATE_KEY_PATH="/path/to/viz_key.p8"
-export SNOWFLAKE_PRIVATE_KEY_PASSPHRASE="<passphrase>"
-
-python viz/walmart-dashboard.py
-```
-
-The script saves `walmart_dashboard.png` and opens a chart window. At the top of the script, a single schema variable controls whether it reads `DBT_DEV` or `GOLD`.
-
-## Design decisions
-
-| Decision                                 | Reason                                                                                                                    |
-| ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
-| Bronze `FACT` loaded as text             | Raw landing should never reject rows. Type problems surface in Silver, where `TRY_CAST` plus `not_null` tests expose them |
-| `NULL_IF` at load time                   | Missing markdowns become real NULLs instead of the string `NA`                                                            |
-| One Silver model per Bronze table        | Each source is cleaned in one place, and joining is left to Gold                                                          |
-| `date_id` as a `YYYYMMDD` integer        | Readable, deterministic, and no hashing needed for a calendar key                                                         |
-| Left join from department sales          | Sales rows are the facts and must never be dropped by a missing store-level row                                           |
-| Incremental merge for SCD1               | Demonstrates update-in-place behavior and keeps the original insert timestamp                                             |
-| Separate roles for dbt and visualization | Least privilege: the notebook user is read-only                                                                           |
-| Key pair authentication                  | Service users have no password or MFA prompt, and keys can be rotated                                                     |
-
-## Testing and data quality
-
-- `not_null` and `unique` tests on key columns
-- Composite uniqueness tests with `dbt_utils.unique_combination_of_columns` on the store dimension and the fact table
-- Row-count comparison between Silver `department` and the fact table to detect join fan-out or dropped rows
-- Date-range and holiday-flag consistency checks between the two source files
-- Foreign key checks from the fact table to both dimensions `[VERIFY: keep only if you implemented them]`
-
-## Results
-
-![Dashboard](docs/walmart_dashboard.png)
-
-The dashboard contains four views: average weekly sales for holiday versus non-holiday weeks, total sales over time, the top 10 departments by total sales, and total sales per store by store type.
+![Weekly Trend](docs/images/dashboard-weekly-trend.png)
 
 ## Limitations
 
-| Limitation                                      | Detail                                                                                                                                                                                                                                             |
-| ----------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Production deployment not run                   | Models were built and tested in a dev schema (`DBT_DEV`), and the dashboard reads from it. The macro that routes models to `SILVER` and `GOLD` exists but was not exercised in a deployed job                                                      |
-| Store-level measures repeat per department      | Temperature, fuel price, CPI, unemployment and markdowns repeat on every department row. Summing them gives wrong results, and averaging across department rows weights each store by its number of departments. Aggregate to store and week first |
-| SCD1 keeps no history                           | Changed values are overwritten. `vrsn_start_date` and `vrsn_end_date` are placeholders, and rows deleted at the source are not removed from Gold                                                                                                   |
-| Date dimension extends past the last sales week | The store-level file covers more weeks than the department sales file, so some dates have no sales                                                                                                                                                 |
-| Store dimension repeats store attributes        | Store type and size repeat for every department, as required by the assignment's schema                                                                                                                                                            |
-| Manual loading                                  | `COPY INTO` runs by hand, with no Snowpipe, scheduling or orchestration                                                                                                                                                                            |
-| Broad setup role                                | The setup script uses `ACCOUNTADMIN`, which is acceptable for a personal project but not for a shared environment                                                                                                                                  |
-| Limited testing                                 | Tests cover keys, uniqueness and basic quality, and the Python code has no automated tests                                                                                                                                                         |
-| Incremental comparison scans the target         | The `NOT EXISTS` filter reads the whole target table each run, which is fine at this size but would not scale to very large tables                                                                                                                 |
-| No CI                                           | There are no automated checks on pull requests                                                                                                                                                                                                     |
-
-## Possible improvements
-
-- Run the production deployment and point the dashboard at `GOLD`
-- Add a scheduled dbt job and automate loading with Snowpipe
-- Add dbt CI on pull requests
-- Track history with dbt snapshots (SCD2) where it is needed
-- Add source freshness checks and more business-rule tests
-
-## Author
-
-`Eze Amadi` | `https://www.linkedin.com/in/ezeamadi/`
+- Overtime and length of stay cannot be calculated from this data.
+- Correlations are weak (none above 0.10) and observational; case mix, facility size and ownership are not controlled for.
+- Staffing covers April to June 2024; the quality measures come from the October 2024 release and cover other periods.
+- A CSV row with too few fields is only caught if a required column ends up empty. A field-count check is a known gap.
+- The 1.0 hours-per-resident-per-day cut-off for implausibly low staffing is a judgment; values continue smoothly past it.
+- The pipeline does not alert if its schedule never fires, or if a run succeeds with wrong data. The row-count query in `sql/` is the manual check.
