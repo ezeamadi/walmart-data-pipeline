@@ -1,0 +1,58 @@
+version: 2
+
+models:
+  - name: stg_stores
+    description: "Cleaned and casted silver layer stores data"
+    columns:
+      - name: store_id
+        tests:
+          - unique
+          - not_null
+      - name: store_size
+        tests:
+          - not_null
+      - name: store_type
+        tests:
+          - not_null
+  - name: stg_department
+    description: "Cleaned and casted silver layer department data"
+    columns:
+      - name: store_id
+        tests:
+          - not_null
+      - name: department_id
+        tests:
+          - not_null
+      - name: weekly_date
+        tests:
+          - not_null
+      - name: weekly_sales_sum
+        tests:
+          - not_null
+      - name: is_holiday
+        tests:
+          - not_null
+  - name: stg_fact
+    description: "Cleaned and casted silver layer fact data"
+    columns:
+      - name: store_id
+        tests:
+          - not_null
+      - name: weekly_date
+        tests:
+          - not_null
+      - name: average_temperature
+        tests:
+          - not_null
+      - name: average_fuel_price
+      - name: markdown1
+      - name: markdown2
+      - name: markdown3
+      - name: markdown4
+      - name: markdown5
+      - name: cpi
+      - name: unemployment
+      - name: is_holiday
+        tests:
+          - not_null
+      - name: store_date

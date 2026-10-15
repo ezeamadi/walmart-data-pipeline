@@ -1,0 +1,61 @@
+version: 2
+
+models:
+  - name: walmart_date_dim
+    description: "Gold layer table for date dimension"
+    columns:
+      - name: date_id
+        tests:
+          - unique
+          - not_null
+      - name: store_date
+      - name: isholiday
+      - name: insert_date
+      - name: update_date
+  - name: walmart_store_dim
+    description: "Gold layer table for store dimension"
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns:
+            - store_id
+            - dept_id
+    columns:
+      - name: store_id
+        tests:
+          - not_null
+      - name: dept_id
+        tests:
+          - not_null
+      - name: store_type
+      - name: store_size
+      - name: insert_date
+      - name: update_date
+  - name: walmart_fact_table
+    description: "Gold layer table for fact table"
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns:
+            - store_id
+            - dept_id
+            - date_id
+    columns:
+      - name: store_id
+        tests:
+          - not_null
+      - name: dept_id
+        tests:
+          - not_null
+      - name: store_weekly_sales
+      - name: fuel_price
+      - name: store_temperature
+      - name: unemployment
+      - name: cpi
+      - name: markdown1
+      - name: markdown2
+      - name: markdown3
+      - name: markdown4
+      - name: markdown5
+      - name: insert_date
+      - name: update_date
+      - name: vrsn_start_date
+      - name: vrsn_end_date
