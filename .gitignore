@@ -1,7 +1,18 @@
-__pycache__/
-*.pyc
+# secrets
+*.p8
+*.pub
+*.pem
+.env
+profiles.yml
+
+# dbt
+target/
+dbt_packages/
+logs/
+
+# python
 .venv/
+__pycache__/
+
+# OS
 .DS_Store
-.idea/
-*.csv
-.vscode/
